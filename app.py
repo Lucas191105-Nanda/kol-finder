@@ -4,1325 +4,993 @@ import hashlib
 import io
 import json
 import re
-import sqlite3
-import threading
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
-from itertools import zip_longest
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable
 
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
-APP_TITLE = "IGI Academy — KOL Finder v3.6"
-SOURCE_MODES = ["TikTok + Instagram", "TikTok saja", "Instagram saja"]
-WORKERS = 4   # request paralel ke SerpApi (naikkan hati-hati, bisa kena rate limit)
-BATCH = 8     # ukuran batch supaya bisa berhenti lebih awal kalau target sudah tercapai
-HISTORY_PATH = Path(__file__).with_name("kol_history.csv")
-CACHE_PATH = Path(__file__).with_name("serp_cache.sqlite")
-CACHE_TTL = 14 * 24 * 3600   # cache SerpApi disimpan 14 hari
-VERIFY_PER_ROUND = 6          # verifikasi profil IG per putaran pencarian (supaya hasil muncul bertahap)
+APP_TITLE = "IGI Academy — KOL Finder v5 (Apify · Study Jepang Batch 2)"
+HERE = Path(__file__).parent if "__file__" in globals() else Path(".")
+HISTORY_PATH = HERE / "kol_history.csv"
+NICHE_PATH = HERE / "niches.json"
+DATABASE_PATH = HERE / "kol_database.csv"
+DM_PATH = HERE / "dm_templates.json"
+CACHE_PATH = HERE / "igi_profile_cache.json"
+CACHE_TTL = 30 * 24 * 3600
+BRIEF_LINK = "https://drive.google.com/file/d/1yA09-zMqxLmrg7ZKBauN9uC6iCVvo94H/view"
+APIFY_BASE = "https://api.apify.com/v2"
+DEFAULT_ACTOR = "apify/instagram-scraper"
+COST_PER_RESULT = 0.0027  # perkiraan kasar USD per hasil (cek harga terbaru di Apify)
 
-# The discovery strategy is intentionally creator-first. The goal is to find PEOPLE
-# whose public content is about Japan, then map them to their Instagram account.
+# ---------------------------------------------------------------- niche (kata biasa = cari profil, diawali # = cari hashtag)
 QUERY_PACKS: dict[str, list[str]] = {
-    "WNI / Japan Life": [
-        '"orang Indonesia di Jepang"',
-        '"WNI di Jepang"',
-        '"tinggal di Jepang" Indonesia',
-        '"hidup di Jepang" Indonesia',
-        '"daily life" Jepang Indonesia',
-        '"Indonesia in Japan"',
-        '"Indonesian in Japan"',
-    ],
-    "Japan Vlog / Experience": [
-        '"Japan vlog" Indonesia',
-        '"vlog di Jepang" Indonesia',
-        '"pengalaman di Jepang" Indonesia',
-        '"pengalaman tinggal di Jepang"',
-        '"pernah tinggal di Jepang"',
-        '"cerita hidup di Jepang" Indonesia',
-        '"kehidupan di Jepang" Indonesia',
-        '"merantau ke Jepang" Indonesia',
-    ],
-    "Work-in-Japan Personal": [
-        '"kerja di Jepang" Indonesia pengalaman',
-        '"pekerja Indonesia di Jepang"',
-        '"pengalaman kerja di Jepang"',
-        '"gaji kerja di Jepang" pengalaman',
-        '"kenshusei" Indonesia pengalaman',
-        '"tokutei ginou" pengalaman Indonesia',
-        '"SSW Jepang" pengalaman pribadi',
-    ],
-    "Japan Culture / Language Personal": [
-        '"bahasa Jepang" creator Indonesia',
-        '"belajar bahasa Jepang" creator',
-        '"budaya Jepang" creator Indonesia',
-        '"perbedaan Indonesia Jepang" creator',
-        '"tips hidup di Jepang" Indonesia',
-        '"Japanese culture" Indonesia creator',
-    ],
+    "Pelajar SMA": ["anak sma", "siswa sma", "pelajar sma", "kelas 12", "content creator pelajar",
+                    "#siswasma", "#anaksma", "#pelajarsma", "#sman"],
+    "Pelajar SMP": ["anak smp", "siswa smp", "pelajar smp", "kelas 9", "#anaksmp", "#siswasmp", "#pelajarsmp"],
+    "Duta / Prestasi": ["duta bahasa", "duta pelajar", "duta genre", "duta sekolah", "siswa berprestasi",
+                        "finalis duta", "#dutabahasa", "#dutapelajar", "#dutagenre", "#siswaberprestasi"],
+    "Organisasi / Public Speaking": ["ketua osis", "osis sma", "mc pelajar", "public speaking pelajar",
+                                     "#osis", "#publicspeaking", "#mcpelajar"],
+    "Study / Edukasi": ["study vlog", "study with me indonesia", "tips belajar sma", "info kuliah",
+                        "#studywithme", "#studyvlog", "#tipsbelajar", "#infokuliah", "#utbk"],
+    "Jepang / Bahasa Asing": ["belajar bahasa jepang", "nihongo indonesia", "kuliah di jepang",
+                              "#belajarbahasajepang", "#nihongo", "#kuliahdijepang", "#studyabroad"],
+    "Kreatif (Foto / Video / Seni)": ["videografer pelajar", "fotografer sma", "editor video pelajar",
+                                      "#videografipelajar", "#fotografisma"],
+    "Lifestyle Remaja": ["school vlog", "daily vlog sma", "#schoolvlog", "#dailyvlog", "#grwmsekolah"],
 }
 
-# These are hard exclusions. They are applied to the TikTok search result AND the final
-# Instagram profile. An institutional signal is enough to remove a candidate.
 HARD_NEGATIVE = {
-    "lpk", "lembaga pelatihan", "training center", "pusat pelatihan",
-    "agency", "agensi", "recruitment", "rekrutmen", "job agency",
-    "job center", "jobcentre", "jobcenter", "penyalur kerja", "penempatan kerja",
-    "lowongan kerja", "loker", "lowongan", "sekolah bahasa", "language school",
-    "kursus bahasa", "kursus", "academy", "akademi", "konsultan", "consultant",
-    "konsultasi pendidikan", "study abroad", "studi ke jepang", "kampus",
-    "universitas", "university", "college", "beasiswa center", "official account",
-    "official", "recruiter", "rekruter", "headhunter", "talent agency", "manpower",
-    "staffing", "sponsor kerja", "penyalur", "jasa visa", "travel agent",
-    "tour & travel", "japan visa service", "working holiday agency",
+    "lpk", "lembaga pelatihan", "agency", "agensi", "recruitment", "rekrutmen",
+    "penyalur", "lowongan", "loker", "konsultan", "consultant", "jasa visa",
+    "travel agent", "tour & travel", "bimbel", "bimbingan belajar", "les privat", "kursus",
+    "sekolah bahasa", "language school", "official account", "info beasiswa", "info loker",
+    "jasa joki", "olshop", "open order",
 }
-
-SOFT_NEGATIVE = {
-    "travel agency": -20,
-    "tour & travel": -18,
-    "travel": -5,  # a personal travel creator can still qualify
-    "tour": -4,
-    "school": -12,
-    "education": -6,
-    "study": -4,
-    "beasiswa": -6,
-    "info loker": -15,
-    "kerja jepang": -1,
-}
+INSTITUTION_USERNAME = re.compile(r"^(sman|smkn|smpn|smas|mtsn|man)\d*[._]|^osis[._]|^(official|info)[._]", re.I)
+SOFT_NEGATIVE = {"travel": -5, "tour": -4, "jual": -10, "promo": -6, "endorse": -4}
 
 POSITIVE = {
-    "orang indonesia di jepang": 30,
-    "wni di jepang": 32,
-    "indonesian in japan": 30,
-    "tinggal di jepang": 27,
-    "hidup di jepang": 24,
-    "daily life": 16,
-    "japan life": 18,
-    "japan vlog": 17,
-    "vlog di jepang": 18,
-    "pengalaman tinggal di jepang": 28,
-    "pengalaman di jepang": 24,
-    "pengalaman kerja di jepang": 30,
-    "pernah kerja di jepang": 28,
-    "pernah tinggal di jepang": 26,
-    "merantau ke jepang": 22,
-    "pekerja indonesia di jepang": 29,
-    "kerja di jepang": 18,
-    "kenshusei": 22,
-    "tokutei ginou": 30,
-    "ssw jepang": 30,
-    "bahasa jepang": 12,
-    "budaya jepang": 11,
-    "perbedaan indonesia jepang": 12,
-    "gaji kerja di jepang": 14,
-    "content creator": 16,
-    "creator": 10,
-    "vlog": 9,
-    "daily": 6,
-    "lifestyle": 6,
-    "experience": 8,
-    "pengalaman": 7,
+    "duta bahasa": 30, "duta berprestasi": 30, "duta pelajar": 28, "duta sekolah": 28,
+    "duta genre": 24, "finalis duta": 26, "duta": 18, "siswa berprestasi": 24,
+    "pelajar berprestasi": 24, "juara": 12, "olimpiade": 14, "paskibra": 12, "mpk": 8, "osis": 12,
+    "kuliah di jepang": 26, "studi di jepang": 26, "belajar bahasa jepang": 24, "bahasa jepang": 18,
+    "nihongo": 16, "jepang": 10, "japan": 8, "kuliah": 8, "beasiswa": 8, "study abroad": 10,
+    "persiapan kuliah": 14, "info kuliah": 12, "bingung kuliah": 14,
+    "student creator": 22, "content creator": 16, "study vlog": 18, "study with me": 16,
+    "public speaking": 14, "tips belajar": 12, "creator": 10, "vlog": 9, "mc": 6, "pengalaman": 6,
 }
-
 PERSONAL_SIGNALS = {
-    "aku": 10, "saya": 10, "gue": 8, "gw": 8,
-    "my life": 9, "daily life": 9, "vlog": 7, "experience": 7,
-    "pengalaman": 7, "merantau": 9, "tinggal": 6, "pekerja": 9,
-    "karyawan": 6, "living in": 6, "life in": 6,
+    "aku": 10, "saya": 10, "gue": 8, "gw": 8, "my life": 9, "vlog": 7,
+    "siswa": 9, "pelajar": 9, "mahasiswa": 9, "student": 9, "sman": 8,
+    "smk": 8, "smp": 8, "alumni": 7, "kelas": 5,
 }
+TOPIC_SIGNALS = ("duta", "pelajar", "siswa", "sma", "smk", "smp", "student", "osis", "kelas",
+                 "prestasi", "mahasiswa", "jepang", "japan", "nihongo")
+DUTA_TERMS = ("duta", "finalis", "paskibra", "osis", "mpk", "berprestasi", "juara", "olimpiade")
+STOPWORDS = {"indonesia", "creator", "content", "sma", "smk", "smp", "pelajar", "siswa", "anak", "vlog", "kelas"}
+DYNAMIC_TERMS: set[str] = set()
+LEVELS = ["SMP", "SMA/SMK", "Mahasiswa/Alumni", "Tidak jelas"]
+STATS: dict[str, int] = {}
 
-JAPAN_SIGNALS = {
-    "jepang": 6, "japan": 6, "nihongo": 5, "nihon": 5,
-    "tokyo": 5, "osaka": 5, "nagoya": 4, "saitama": 4,
-    "kyoto": 4, "fukuoka": 4, "hiroshima": 3, "hokkaido": 3,
-}
-
-CITY_SIGNALS = {k for k in JAPAN_SIGNALS if k not in {"jepang", "japan", "nihongo", "nihon"}}
 
 @dataclass
 class Candidate:
-    platform_source: str
-    source_username: str
-    source_url: str
-    instagram_username: str = ""
-    instagram_url: str = ""
-    title: str = ""
+    username: str
+    url: str
     snippet: str = ""
     full_name: str = ""
     biography: str = ""
     followers: int | None = None
-    following: int | None = None
-    is_business: bool | None = None
-    is_professional: bool | None = None
     is_private: bool | None = None
-    is_verified: bool | None = None
+    is_business: bool | None = None
     category: str = ""
-    engagement_score: float = 0.0
-    match_confidence: int = 0
-    relevance: int = 0
-    personal_score: int = 0
-    closing_score: int = 0
-    risk_score: int = 0
+    level: str = "Tidak jelas"
+    contact: str = ""
+    engagement: float = 0.0
+    prospect: int = 0
+    creator: int = 0
+    risk: int = 0
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    source_queries: set[str] = field(default_factory=set)
-    followers_hint: int | None = None
-    tiktok_username: str = ""
     sources: set[str] = field(default_factory=set)
+    status: str = "Terverifikasi"
 
 
+# ---------------------------------------------------------------- helpers
 def clean_text(*values: object) -> str:
-    out = []
-    for v in values:
-        if v is None:
-            continue
-        try:
-            if pd.isna(v):
-                continue
-        except Exception:
-            pass
-        text = str(v).strip()
-        if text:
-            out.append(text)
-    return " ".join(out)
+    return " ".join(str(v).strip() for v in values if v is not None and str(v).strip() and str(v) != "nan")
+
+
+def has(term: str, hay: str) -> bool:
+    tail = r"(?![a-z0-9])" if len(term) <= 3 else ""
+    return bool(re.search(r"(?<![a-z0-9])" + re.escape(term) + tail, hay))
 
 
 def normalize_handle(value: object) -> str | None:
     if value is None:
         return None
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
     text = str(value).strip()
-    if not text:
-        return None
-    patterns = [
-        r"(?:instagram\.com)/(?:@)?([A-Za-z0-9._]{2,50})",
-        r"(?:tiktok\.com)/@([A-Za-z0-9._]{2,50})",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            text = m.group(1)
-            break
-    else:
-        text = text.replace("instagram:", " ").replace("tiktok:", " ")
-        text = text.split("/")[-1].strip().lstrip("@").split()[0]
-    text = text.strip().lstrip("@").rstrip(".,;:")
-    return text.lower() if re.fullmatch(r"[A-Za-z0-9._]{2,50}", text) else None
+    m = re.search(r"instagram\.com/(?:@)?([A-Za-z0-9._]{2,30})", text, re.I)
+    if m:
+        text = m.group(1)
+    text = text.lstrip("@").split("/")[-1].split()[0].rstrip(".,;:") if text else ""
+    return text.lower() if re.fullmatch(r"[A-Za-z0-9._]{2,30}", text) else None
 
 
-def extract_platform_handles(text: str) -> set[tuple[str, str]]:
-    found: set[tuple[str, str]] = set()
-    for m in re.finditer(r"instagram\.com/(?:@)?([A-Za-z0-9._]{2,50})", text, re.I):
-        u = m.group(1).lower()
-        if u not in {"p", "reel", "reels", "stories", "explore", "accounts", "directory", "tv"}:
-            found.add(("Instagram", u))
-    for m in re.finditer(r"tiktok\.com/@([A-Za-z0-9._]{2,50})", text, re.I):
-        found.add(("TikTok", m.group(1).lower()))
-    return found
-
-
-def load_blacklist(uploaded_file: object | None, cross_platform: bool = True) -> set[tuple[str, str]]:
-    found: set[tuple[str, str]] = set()
-    if uploaded_file is not None:
-        data = uploaded_file.getvalue()
-        name = str(getattr(uploaded_file, "name", "")).lower()
+def load_blacklist(uploaded: object | None) -> set[str]:
+    found: set[str] = set()
+    if uploaded is not None:
+        data = uploaded.getvalue()
+        name = str(getattr(uploaded, "name", "")).lower()
         try:
             if name.endswith(".csv"):
-                frames = [pd.read_csv(io.BytesIO(data), dtype=object)]
+                frames = [pd.read_csv(io.BytesIO(data), dtype=object, header=None)]
             else:
                 xls = pd.ExcelFile(io.BytesIO(data))
-                frames = [pd.read_excel(io.BytesIO(data), sheet_name=s, header=None, dtype=object) for s in xls.sheet_names]
+                frames = [pd.read_excel(xls, sheet_name=s, header=None, dtype=object) for s in xls.sheet_names]
             for df in frames:
-                for _, row in df.iterrows():
-                    row_text = clean_text(*row.tolist())
-                    found |= extract_platform_handles(row_text)
-                    for value in row.tolist():
-                        u = normalize_handle(value)
-                        if u and not str(value).startswith("http"):
-                            # Existing IGI monitoring sheet is primarily Instagram.
-                            found.add(("Instagram", u))
+                for value in df.to_numpy().ravel():
+                    u = normalize_handle(value)
+                    if u:
+                        found.add(u)
         except Exception:
             pass
     if HISTORY_PATH.exists():
         try:
-            hist = pd.read_csv(HISTORY_PATH, dtype=str)
-            for _, row in hist.iterrows():
-                p = str(row.get("platform", "Instagram")).strip() or "Instagram"
-                u = normalize_handle(row.get("username", ""))
+            for v in pd.read_csv(HISTORY_PATH, dtype=str).get("username", []):
+                u = normalize_handle(v)
                 if u:
-                    found.add((p, u))
+                    found.add(u)
         except Exception:
             pass
-    if cross_platform:
-        handles = {u for _, u in found}
-        found |= {(p, u) for u in handles for p in ("Instagram", "TikTok")}
     return found
 
 
-def record_contacted(platform: str, username: str, status: str = "DM Sent") -> None:
-    u = normalize_handle(username) or username.lower().lstrip("@")
-    row = pd.DataFrame([{
-        "platform": platform,
-        "username": f"@{u}",
-        "status": status,
-        "timestamp": pd.Timestamp.now().isoformat(timespec="seconds"),
-    }])
+def record_contacted(username: str, status: str = "Sudah dihubungi") -> None:
+    row = pd.DataFrame([{"username": f"@{username}", "status": status,
+                         "timestamp": pd.Timestamp.now().isoformat(timespec="seconds")}])
     try:
         if HISTORY_PATH.exists():
-            old = pd.read_csv(HISTORY_PATH, dtype=str)
-            old = pd.concat([old, row], ignore_index=True)
-            old.drop_duplicates(subset=["platform", "username"], keep="last").to_csv(HISTORY_PATH, index=False)
-            return
+            row = pd.concat([pd.read_csv(HISTORY_PATH, dtype=str), row], ignore_index=True)
+        row.drop_duplicates(subset=["username"], keep="last").to_csv(HISTORY_PATH, index=False)
     except Exception:
-        pass
-    row.to_csv(HISTORY_PATH, index=False)
+        row.to_csv(HISTORY_PATH, index=False)
 
 
-def parse_followers(text: str) -> int | None:
-    if not text:
-        return None
-    patterns = [
-        r"([0-9]+(?:[.,][0-9]+)?)\s*([KkMm])\s*(?:followers|pengikut)",
-        r"(?:followers|pengikut)\D{0,15}([0-9]+(?:[.,][0-9]+)?)\s*([KkMm])?",
-        r"([0-9]{1,3}(?:[.,][0-9]{3})+)\s*(?:followers|pengikut)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if not m:
-            continue
-        raw = m.group(1)
-        suffix = (m.group(2) or "").lower()
-        try:
-            if suffix:
-                return int(float(raw.replace(",", ".")) * (1_000 if suffix == "k" else 1_000_000))
-            return int(raw.replace(".", "").replace(",", ""))
-        except ValueError:
-            continue
-    return None
-
-
-def extract_tiktok_profile(link: str) -> str | None:
-    try:
-        p = urlparse(link)
-    except Exception:
-        return None
-    if "tiktok.com" not in p.netloc.lower():
-        return None
-    m = re.match(r"@([A-Za-z0-9._]{2,50})(?:/.*)?$", p.path.strip("/"))
-    return m.group(1).lower() if m else None
-
-
-def extract_instagram_profile(link: str) -> str | None:
-    try:
-        p = urlparse(link)
-    except Exception:
-        return None
-    if "instagram.com" not in p.netloc.lower():
-        return None
-    path = p.path.strip("/")
-    if not path:
-        return None
-    first = path.split("/")[0].lstrip("@")
-    if first.lower() in {"p", "reel", "reels", "stories", "explore", "accounts", "directory", "tv"}:
-        return None
-    return normalize_handle(first)
-
-
-def hard_excluded(text: str) -> tuple[bool, list[str]]:
+def hard_excluded(text: str, username: str = "") -> bool:
     low = text.lower()
-    hits = [term for term in HARD_NEGATIVE if term in low]
-    return bool(hits), hits[:10]
+    return any(t in low for t in HARD_NEGATIVE) or bool(INSTITUTION_USERNAME.search(username))
 
 
-def name_similarity(a: str, b: str) -> float:
-    def norm(s: str) -> str:
-        s = re.sub(r"[^a-z0-9 ]+", " ", s.lower()).replace("_", " ").replace(".", " ")
-        return re.sub(r"\s+", " ", s).strip()
-    aa, bb = norm(a), norm(b)
-    if not aa or not bb:
-        return 0.0
-    return SequenceMatcher(None, aa, bb).ratio()
+def detect_level(text: str) -> str:
+    low = text.lower()
+    if re.search(r"\b(smp|mts|smpn)\b|kelas\s*(7|8|9)\b", low):
+        return "SMP"
+    if re.search(r"\b(sma|sman|smk|smkn|smas|man)\b|kelas\s*(10|11|12|x|xi|xii)\b", low):
+        return "SMA/SMK"
+    if re.search(r"\b(mahasiswa|mahasiswi|alumni|s1|ui|ugm|its|ub|unair|undip|uin)\b", low):
+        return "Mahasiswa/Alumni"
+    return "Tidak jelas"
 
 
-def score_match(tiktok_username: str, tiktok_title: str, instagram_username: str, instagram_name: str, instagram_bio: str) -> int:
-    score = 0
-    if instagram_username.lower() == tiktok_username.lower():
-        score += 65
-    elif instagram_username.lower().replace("_", "").replace(".", "") == tiktok_username.lower().replace("_", "").replace(".", ""):
-        score += 50
-    sim = name_similarity(tiktok_title, instagram_name)
-    if sim >= 0.85:
-        score += 25
-    elif sim >= 0.70:
-        score += 18
-    elif sim >= 0.55:
-        score += 10
-    low_bio = instagram_bio.lower()
-    if any(k in low_bio for k in ("tiktok", tiktok_username.lower().lstrip("@"))):
-        score += 10
-    return min(100, score)
+def extract_contact(text: str) -> str:
+    emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    wa = re.findall(r"(?:\+62|62|0)8[0-9][0-9\s-]{7,12}", text)
+    return " | ".join(dict.fromkeys(emails + [w.strip() for w in wa]))[:200]
+
+
+def needs_guardian(level: str) -> str:
+    if level in ("SMP", "SMA/SMK"):
+        return "YA, izin orang tua/wali"
+    if level == "Tidak jelas":
+        return "Cek usia dulu"
+    return "Tidak"
 
 
 def engagement_from_posts(posts: Any, followers: int | None) -> float:
-    if not isinstance(posts, list) or not posts:
+    if not isinstance(posts, list) or not posts or not followers:
         return 0.0
-    likes: list[float] = []
-    comments: list[float] = []
-    for post in posts[:12]:
-        if not isinstance(post, dict):
+    likes, cmts = [], []
+    for p in posts[:12]:
+        if not isinstance(p, dict):
             continue
-        for key in ("likes", "like_count"):
-            if isinstance(post.get(key), (int, float)):
-                likes.append(float(post[key])); break
-        for key in ("comments", "comment_count"):
-            if isinstance(post.get(key), (int, float)):
-                comments.append(float(post[key])); break
-    if not likes or not followers:
+        lk = p.get("likesCount", p.get("likes"))
+        cm = p.get("commentsCount", p.get("comments"))
+        if isinstance(lk, (int, float)) and lk >= 0:  # Instagram kadang menyembunyikan likes (-1)
+            likes.append(float(lk))
+        if isinstance(cm, (int, float)) and cm >= 0:
+            cmts.append(float(cm))
+    if not likes:
         return 0.0
-    avg_likes = sum(likes) / len(likes)
-    like_rate = avg_likes / followers
-    avg_comments = sum(comments) / len(comments) if comments else 0.0
-    comment_rate = avg_comments / followers if followers else 0.0
-    score = 0.0
-    if like_rate >= 0.08: score += 50
-    elif like_rate >= 0.04: score += 40
-    elif like_rate >= 0.02: score += 30
-    elif like_rate >= 0.01: score += 20
-    elif like_rate >= 0.005: score += 10
-    if comment_rate >= 0.01: score += 25
-    elif comment_rate >= 0.004: score += 18
-    elif comment_rate >= 0.001: score += 10
-    return min(100.0, score)
+    lr = (sum(likes) / len(likes)) / followers
+    cr = (sum(cmts) / len(cmts)) / followers if cmts else 0.0
+    s = 50 if lr >= 0.08 else 40 if lr >= 0.04 else 30 if lr >= 0.02 else 20 if lr >= 0.01 else 10 if lr >= 0.005 else 0
+    s += 25 if cr >= 0.01 else 18 if cr >= 0.004 else 10 if cr >= 0.001 else 0
+    return float(min(100, s))
+
+
+def hay_of(c: Candidate) -> str:
+    return clean_text(c.snippet, c.full_name, c.biography, c.category, c.username).lower()
+
+
+def signals(hay: str) -> tuple[int, int, list[str]]:
+    rel = per = 0
+    reasons: list[str] = []
+    for term, w in POSITIVE.items():
+        if has(term, hay) or (" " in term and term.replace(" ", "") in hay):  # cocokkan juga bentuk #hashtag
+            rel += w
+            if len(reasons) < 8:
+                reasons.append(term)
+    for term, w in PERSONAL_SIGNALS.items():
+        if has(term, hay):
+            per += w
+    for term in DYNAMIC_TERMS:
+        if term in hay or term.replace(" ", "") in hay:
+            rel += 15
+            if len(reasons) < 8:
+                reasons.append(term)
+    return rel, per, reasons
+
+
+def duta_tags(hay: str) -> str:
+    return ", ".join(t for t in DUTA_TERMS if has(t, hay))
 
 
 def score_candidate(c: Candidate) -> None:
-    hay = clean_text(c.title, c.snippet, c.full_name, c.biography, c.category, c.source_username, c.instagram_username).lower()
-    relevance = 0
-    personal = 0
-    closing = 0
+    hay = hay_of(c)
+    rel, per, c.reasons = signals(hay)
     risk = 0
-    reasons: list[str] = []
-    warnings: list[str] = []
-
-    for term, weight in POSITIVE.items():
-        if term in hay:
-            relevance += weight
-            closing += weight
-            if len(reasons) < 10:
-                reasons.append(term)
-    for term, weight in PERSONAL_SIGNALS.items():
-        if term in hay:
-            personal += weight
-            relevance += weight // 2
-            closing += weight
-    for term, weight in JAPAN_SIGNALS.items():
-        if term in hay:
-            relevance += weight
-            closing += weight // 2
-    for term, penalty in SOFT_NEGATIVE.items():
-        if term in hay:
-            risk += abs(penalty)
-            relevance += penalty
-            closing += penalty
-            warnings.append(term)
-
-    if c.match_confidence >= 90:
-        closing += 12
-    elif c.match_confidence >= 75:
-        closing += 7
-    elif c.match_confidence < 60:
+    for term, pen in SOFT_NEGATIVE.items():
+        if has(term, hay):
+            risk += abs(pen)
+            rel += pen
+            c.warnings.append(term)
+    if not any(has(k, hay) for k in TOPIC_SIGNALS) and not any(k in hay for k in DYNAMIC_TERMS):
         risk += 20
-        warnings.append("match IG dari TikTok kurang kuat")
-
-    if c.followers is not None:
-        if 1_000 <= c.followers <= 3_000:
-            relevance += 10; closing += 9
-        elif 3_001 <= c.followers <= 7_500:
-            relevance += 13; closing += 13
-        else:
-            relevance += 10; closing += 10
-    else:
-        risk += 40
-        warnings.append("followers IG tidak terverifikasi")
-
-    if c.is_business is True:
-        # Do not hard reject: creators often use professional/business accounts.
-        risk += 8
-        warnings.append("professional/business account")
-    if c.is_private is True:
-        risk += 25
-        warnings.append("akun private")
-    if c.is_verified is True:
-        closing += 2
-
-    if c.engagement_score:
-        closing += int(c.engagement_score * 0.20)
-
-    # Personal creator gate: strong Japan + personal signal, not just a keyword.
-    if not any(k in hay for k in ("jepang", "japan", "tokyo", "osaka", "nihon", "nihongo")):
-        risk += 20
-        warnings.append("sinyal Jepang lemah")
-    if personal < 8:
+        c.warnings.append("sinyal pelajar/duta lemah")
+    if per < 8:
         risk += 15
-        warnings.append("personal signal lemah")
-
-    c.relevance = max(0, min(100, relevance))
-    c.personal_score = max(0, min(100, personal))
-    c.risk_score = max(0, min(100, risk))
-    c.closing_score = max(0, min(100, closing - max(0, risk - 15)))
-    c.reasons = reasons[:10]
-    c.warnings = warnings[:10]
-
-
-class OutOfBudget(RuntimeError):
-    """Batas kredit per run tercapai atau kredit SerpApi habis."""
-
-
-class SerpBudget:
-    def __init__(self, limit: int = 10**9) -> None:
-        self.lock = threading.Lock()
-        self.reset(limit)
-
-    def reset(self, limit: int) -> None:
-        self.limit = int(limit)
-        self.used = 0
-        self.cache_hits = 0
-        self.reason = ""
-
-    def spend(self) -> None:
-        with self.lock:
-            if self.reason:
-                raise OutOfBudget(self.reason)
-            if self.used >= self.limit:
-                self.reason = f"batas {self.limit} kredit per run tercapai"
-                raise OutOfBudget(self.reason)
-            self.used += 1
-
-    def hit(self) -> None:
-        with self.lock:
-            self.cache_hits += 1
-
-    def mark_exhausted(self, msg: str) -> None:
-        with self.lock:
-            self.reason = msg
+        c.warnings.append("sinyal personal lemah")
+    if c.is_business:
+        risk += 8
+        c.warnings.append("akun professional/business")
+    if c.followers is None:
+        risk += 40
+        c.warnings.append("followers tidak terbaca")
+    if not c.contact:
+        c.warnings.append("tidak ada kontak di bio")
+    if c.level in ("SMP", "SMA/SMK"):
+        rel += 6
+    c.creator = max(0, min(100, per))
+    c.risk = max(0, min(100, risk))
+    prospect = rel + per // 2 + int(c.engagement * 0.2) + (6 if c.contact else 0)
+    c.prospect = max(0, min(100, prospect - max(0, risk - 15)))
 
 
-BUDGET = SerpBudget()
-_cache_lock = threading.Lock()
-_cache_db: sqlite3.Connection | None = None
+# ---------------------------------------------------------------- Apify client
+class ApifyError(Exception):
+    def __init__(self, msg: str, fatal: bool = False):
+        super().__init__(msg)
+        self.fatal = fatal
 
 
-def _db() -> sqlite3.Connection:
-    global _cache_db
-    if _cache_db is None:
-        _cache_db = sqlite3.connect(str(CACHE_PATH), check_same_thread=False)
-        _cache_db.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, ts REAL, v TEXT)")
-        _cache_db.commit()
-    return _cache_db
+TERMINAL = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 
 
-def cache_key(params: dict[str, Any]) -> str:
-    clean = {k: v for k, v in params.items() if k != "api_key"}
-    return hashlib.sha1(json.dumps(clean, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
-
-def cache_get(key: str) -> dict | None:
+def apify_call(method: str, path: str, token: str, **kw: Any) -> Any:
     try:
-        with _cache_lock:
-            row = _db().execute("SELECT ts, v FROM cache WHERE k=?", (key,)).fetchone()
-        if row and time.time() - row[0] <= CACHE_TTL:
-            return json.loads(row[1])
-    except Exception:
-        pass
-    return None
-
-
-def cache_set(key: str, payload: dict) -> None:
+        r = requests.request(method, APIFY_BASE + path, headers={"Authorization": f"Bearer {token}"},
+                             timeout=(10, 90), **kw)
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise ApifyError(f"Koneksi ke Apify gagal: {exc}") from exc
+    if r.status_code in (401, 403):
+        raise ApifyError("Token Apify tidak valid atau tidak punya akses.", fatal=True)
+    if r.status_code in (402,):
+        raise ApifyError("Kredit / batas pemakaian Apify habis.", fatal=True)
+    if r.status_code >= 400:
+        raise ApifyError(f"Apify HTTP {r.status_code}: {r.text[:200]}")
     try:
-        with _cache_lock:
-            db = _db()
-            db.execute("INSERT OR REPLACE INTO cache (k, ts, v) VALUES (?, ?, ?)", (key, time.time(), json.dumps(payload)))
-            db.commit()
-    except Exception:
-        pass
-
-
-def serpapi_request(session: requests.Session, params: dict[str, Any], timeout=(10, 60), retries=2) -> dict:
-    # 1) Cache dulu: pencarian yang sama tidak dibayar dua kali
-    key = cache_key(params)
-    cached = cache_get(key)
-    if cached is not None:
-        BUDGET.hit()
-        if "_error" in cached:
-            raise RuntimeError(cached["_error"])
-        return cached
-
-    # 2) Cek batas kredit sebelum request
-    BUDGET.spend()
-
-    last_error: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            r = session.get("https://serpapi.com/search.json", params=params, timeout=timeout)
-            try:
-                payload = r.json()
-            except ValueError:
-                payload = {}
-            err = payload.get("error") if isinstance(payload, dict) else None
-            if err:
-                low = str(err).lower()
-                if "out of searches" in low or "run out" in low:
-                    msg = "kredit SerpApi habis"
-                    BUDGET.mark_exhausted(msg)
-                    raise OutOfBudget(msg)
-                if "hasn't returned any results" in low or "no results" in low:
-                    cache_set(key, {"_error": str(err)})  # hasil kosong juga di-cache
-                raise RuntimeError(str(err))
-            r.raise_for_status()
-            cache_set(key, payload)
-            return payload
-        except requests.HTTPError as exc:
-            try:
-                detail = exc.response.json().get("error", str(exc))
-            except Exception:
-                detail = str(exc)
-            raise RuntimeError(detail) from exc
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            last_error = exc
-            if attempt < retries:
-                time.sleep(2 + 2 * attempt)
-    raise RuntimeError("Timeout/koneksi ke SerpApi setelah beberapa percobaan.") from last_error
-
-
-def serpapi_web_search(api_key: str, query: str, engine: str, page: int, location: str) -> dict:
-    session = requests.Session()
-    params = {
-        "engine": engine,
-        "q": query,
-        "api_key": api_key,
-        "cc": "id",
-        "safeSearch": "Strict" if engine == "bing" else None,
-    }
-    if engine == "bing":
-        params["first"] = 1 + page * 10
-        params["count"] = 10
-    else:
-        params["start"] = page * 10
-        params["gl"] = "id"
-        params["hl"] = "id"
-    if location:
-        params["location"] = location
-    params = {k: v for k, v in params.items() if v is not None}
-    return serpapi_request(session, params)
-
-
-def search_web(api_key: str, query: str, page: int, location: str, engine_mode: str) -> tuple[list[dict], list[str]]:
-    engines = {
-        "Bing": ["bing"],
-        "Google": ["google"],
-        "Auto (Bing → Google)": ["bing", "google"],
-    }.get(engine_mode, ["bing"])
-    errors = []
-    for engine in engines:
-        try:
-            payload = serpapi_web_search(api_key, query, engine, page, location)
-            return payload.get("organic_results", []), errors
-        except OutOfBudget:
-            raise
-        except Exception as exc:
-            errors.append(f"{engine}: {exc}")
-    return [], errors
-
-
-def instagram_profile_lookup(api_key: str, username: str) -> dict:
-    session = requests.Session()
-    params = {
-        "engine": "instagram_profile",
-        "profile_id": username,
-        "api_key": api_key,
-        "json_restrictor": "profile_results(biography,followers,following,full_name,username,is_business_account,is_professional_account,is_private,is_verified,category_name,business_category_name,posts)",
-    }
-    return serpapi_request(session, params, timeout=(10, 50), retries=1).get("profile_results", {}) or {}
-
-
-def map_tiktok_to_instagram(api_key: str, tiktok: Candidate, location: str, engine_mode: str) -> tuple[str | None, int, list[str]]:
-    # 1) If the TikTok result already exposes an Instagram URL, use it first.
-    for text in (tiktok.title, tiktok.snippet, tiktok.source_url):
-        m = re.search(r"instagram\.com/(?:@)?([A-Za-z0-9._]{2,50})", text, re.I)
-        if m:
-            ig = normalize_handle(m.group(1))
-            if ig:
-                return ig, 75, ["Instagram ditemukan dari hasil TikTok"]
-
-    queries = []
-    u = tiktok.source_username
-    title = tiktok.title.strip()
-    if u:
-        queries.append(f'site:instagram.com "{u}"')
-    if title:
-        queries.append(f'site:instagram.com "{title}"')
-    if u and title:
-        queries.append(f'site:instagram.com "{u}" "{title}"')
-
-    candidates: list[tuple[str, int, str]] = []
-    for q in queries[:3]:
-        items, _errors = search_web(api_key, q, 0, location, engine_mode)
-        for item in items:
-            link = str(item.get("link", ""))
-            ig = extract_instagram_profile(link)
-            if not ig:
-                continue
-            match = score_match(u, title, ig, str(item.get("title", "")), str(item.get("snippet", "")))
-            candidates.append((ig, match, q))
-    if not candidates:
-        return None, 0, []
-    candidates.sort(key=lambda x: -x[1])
-    best_ig, conf, q = candidates[0]
-    return best_ig, conf, [f"Match dari pencarian: {q}"]
-
-
-IG_BIO_PATTERNS = [
-    r"instagram\.com/(?:@)?([A-Za-z0-9._]{2,30})",
-    r"\b(?:ig|insta(?:gram)?)\b\s*(?:[:：=|\-–]\s*@?|@)\s*([A-Za-z0-9._]{2,30})",
-    r"@([A-Za-z0-9._]{2,30})\s*\(?\s*(?:ig|instagram)\b",
-]
-IG_HANDLE_BLOCK = {
-    "p", "reel", "reels", "stories", "explore", "accounts", "directory", "tv", "tiktok", "instagram",
-    "ig", "gmail", "yahoo", "whatsapp", "wa", "line", "youtube", "facebook", "linktr", "linktree", "com",
-}
-TIKTOK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-             "Chrome/124.0 Safari/537.36")
-
-
-def extract_ig_from_bio(text: str) -> str | None:
-    """Ambil username Instagram yang tertulis di bio/snippet TikTok (IG: xxx, @xxx ig, instagram.com/xxx)."""
-    if not text:
-        return None
-    for pat in IG_BIO_PATTERNS:
-        for m in re.finditer(pat, text, re.I):
-            ig = normalize_handle(m.group(1).rstrip("."))
-            if ig and len(ig) >= 3 and ig not in IG_HANDLE_BLOCK:
-                return ig
-    return None
-
-
-def fetch_tiktok_bio(username: str) -> str:
-    """Baca bio langsung dari halaman profil TikTok (tanpa SerpApi). Gagal = string kosong."""
-    try:
-        r = requests.get(
-            f"https://www.tiktok.com/@{username}",
-            headers={"User-Agent": TIKTOK_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"},
-            timeout=(5, 8),
-        )
-        if r.status_code != 200:
-            return ""
-        m = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', r.text, re.S)
-        if not m:
-            return ""
-        data = json.loads(m.group(1))
-        user = (data.get("__DEFAULT_SCOPE__", {}).get("webapp.user-detail", {})
-                .get("userInfo", {}).get("user", {}))
-        bio_link = (user.get("bioLink") or {}).get("link")
-        return clean_text(user.get("nickname"), user.get("signature"), bio_link)
-    except Exception:
-        return ""
-
-
-def resolve_instagram(api_key: str, t: "Candidate", location: str, engine_mode: str,
-                      fetch_bio: bool, search_fallback: bool) -> tuple[str | None, int, list[str]]:
-    """Cari IG milik kreator TikTok. Urutan: snippet -> bio halaman TikTok (gratis) -> pencarian (opsional, boros)."""
-    ig = extract_ig_from_bio(clean_text(t.title, t.snippet))
-    if ig:
-        return ig, 90, ["IG tertulis di snippet/bio TikTok"]
-    if fetch_bio:
-        bio = fetch_tiktok_bio(t.tiktok_username)
-        if bio:
-            excluded, _hits = hard_excluded(bio)
-            if excluded:
-                return None, 0, ["bio TikTok terdeteksi institusi"]
-            t.snippet = clean_text(t.snippet, bio)  # bio ikut dipakai untuk scoring
-            ig = extract_ig_from_bio(bio)
-            if ig:
-                return ig, 95, ["IG tertulis di bio TikTok"]
-    if search_fallback:
-        return map_tiktok_to_instagram(api_key, t, location, engine_mode)
-    return None, 0, []
-
-
-def ig_followers_hint(text: str) -> int | None:
-    """Tebak followers IG dari snippet pencarian ('1,234 Followers, 500 Following'). Hanya untuk pre-filter hemat kredit."""
-    m = re.search(r"([0-9][0-9.,]*)\s*(K|M|rb|jt)?\s*(?:Followers|Pengikut)\b", text, re.I)
-    if not m:
-        return None
-    raw, suffix = m.group(1), (m.group(2) or "").lower()
-    try:
-        if suffix:
-            mult = 1_000 if suffix in ("k", "rb") else 1_000_000
-            return int(float(raw.replace(",", ".")) * mult)
-        return int(re.sub(r"[.,]", "", raw))
-    except ValueError:
-        return None
-
-
-def tiktok_round(api_key: str, query: str, page: int, blacklist: set[tuple[str, str]], location: str, engine_mode: str) -> tuple[list[Candidate], list[str]]:
-    items, errs = search_web(api_key, f'site:tiktok.com/@ {query}', page, location, engine_mode)
-    out: list[Candidate] = []
-    seen: set[str] = set()
-    for item in items:
-        u = extract_tiktok_profile(str(item.get("link", "")))
-        if not u or u in seen or ("TikTok", u) in blacklist:
-            continue
-        title = str(item.get("title", ""))
-        snippet = str(item.get("snippet", ""))
-        excluded, _hits = hard_excluded(clean_text(title, snippet, u, query))
-        if excluded:
-            continue
-        seen.add(u)
-        out.append(Candidate(
-            platform_source="TikTok", source_username=u, source_url=f"https://www.tiktok.com/@{u}",
-            title=title, snippet=snippet, source_queries={query}, tiktok_username=u, sources={"TikTok"},
-        ))
-    return out, errs
-
-
-def instagram_round(api_key: str, query: str, page: int, blacklist: set[tuple[str, str]], location: str, engine_mode: str) -> tuple[list[Candidate], list[str]]:
-    items, errs = search_web(api_key, f'site:instagram.com {query}', page, location, engine_mode)
-    out: list[Candidate] = []
-    seen: set[str] = set()
-    for item in items:
-        u = extract_instagram_profile(str(item.get("link", "")))
-        if not u or u in seen or ("Instagram", u) in blacklist:
-            continue
-        title = str(item.get("title", ""))
-        snippet = str(item.get("snippet", ""))
-        excluded, _hits = hard_excluded(clean_text(title, snippet, u, query))
-        if excluded:
-            continue
-        seen.add(u)
-        out.append(Candidate(
-            platform_source="Instagram", source_username=u, source_url=f"https://www.instagram.com/{u}/",
-            instagram_username=u, instagram_url=f"https://www.instagram.com/{u}/",
-            title=title, snippet=snippet, match_confidence=100, source_queries={query}, sources={"Instagram"},
-            followers_hint=ig_followers_hint(clean_text(title, snippet)),
-        ))
-    return out, errs
-
-
-def enrich_from_instagram(api_key: str, c: Candidate) -> Candidate:
-    try:
-        profile = instagram_profile_lookup(api_key, c.instagram_username)
-        c.full_name = str(profile.get("full_name") or "")
-        c.biography = str(profile.get("biography") or "")
-        c.followers = int(profile["followers"]) if profile.get("followers") is not None else None
-        c.following = int(profile["following"]) if profile.get("following") is not None else None
-        c.is_business = profile.get("is_business_account")
-        c.is_professional = profile.get("is_professional_account")
-        c.is_private = profile.get("is_private")
-        c.is_verified = profile.get("is_verified")
-        c.category = clean_text(profile.get("category_name"), profile.get("business_category_name"))
-        c.engagement_score = engagement_from_posts(profile.get("posts"), c.followers)
-        c.instagram_url = f"https://www.instagram.com/{c.instagram_username}/"
-        match = score_match(c.source_username, c.title, c.instagram_username, c.full_name, c.biography)
-        c.match_confidence = max(c.match_confidence, match)
-        combined = clean_text(c.full_name, c.biography, c.category)
-        excluded, hits = hard_excluded(combined)
-        if excluded:
-            c.warnings.extend([f"terdeteksi: {h}" for h in hits])
-        score_candidate(c)
-    except OutOfBudget:
-        raise
+        return r.json()
     except Exception as exc:
-        c.warnings.append(f"verifikasi IG gagal: {exc}")
-    return c
+        raise ApifyError("Balasan Apify bukan JSON.") from exc
 
 
-def build_queries(selected_packs: list[str], extra_keywords: list[str]) -> list[str]:
-    seen: set[str] = set(); out: list[str] = []
-    for pack in selected_packs:
-        for q in QUERY_PACKS.get(pack, []):
-            k = q.lower().strip()
-            if k and k not in seen:
-                seen.add(k); out.append(q)
-    for q in extra_keywords:
-        k = q.lower().strip()
-        if k and k not in seen:
-            seen.add(k); out.append(q.strip())
+def run_actor(token: str, actor: str, payload: dict, max_wait: int = 240, max_cost: float = 0.0,
+              items_limit: int = 1000) -> list[dict]:
+    """Jalankan actor, tunggu selesai (maks max_wait detik), ambil hasil. Kalau timeout: abort & ambil hasil sebagian."""
+    actor_id = actor.strip().replace("/", "~")
+    q = f"?maxTotalChargeUsd={max_cost}" if max_cost and max_cost > 0 else ""
+    try:
+        run = apify_call("POST", f"/acts/{actor_id}/runs{q}", token, json=payload)
+    except ApifyError as exc:
+        if q and "HTTP 400" in str(exc):  # actor tanpa dukungan batas biaya
+            run = apify_call("POST", f"/acts/{actor_id}/runs", token, json=payload)
+        else:
+            raise
+    data = run.get("data", {})
+    rid, ds, status = data.get("id"), data.get("defaultDatasetId"), data.get("status", "READY")
+    if not rid:
+        raise ApifyError("Apify tidak mengembalikan ID run.")
+    deadline = time.time() + max_wait
+    info: dict = data
+    while status not in TERMINAL and time.time() < deadline:
+        info = apify_call("GET", f"/actor-runs/{rid}?waitForFinish=20", token).get("data", {})
+        status = info.get("status", status)
+        ds = info.get("defaultDatasetId", ds)
+    if status not in TERMINAL:
+        try:
+            apify_call("POST", f"/actor-runs/{rid}/abort", token)
+        except ApifyError:
+            pass
+    items = apify_call("GET", f"/datasets/{ds}/items?clean=true&format=json&limit={items_limit}", token)
+    items = items if isinstance(items, list) else []
+    if status in ("FAILED", "ABORTED") and not items:
+        raise ApifyError(f"Run Apify {status}: {info.get('statusMessage', '')}")
+    return [i for i in items if isinstance(i, dict)]
+
+
+def g(d: dict, *keys: str, default: Any = None) -> Any:
+    for k in keys:
+        if d.get(k) is not None:
+            return d[k]
+    return default
+
+
+def profile_dict(item: dict) -> dict | None:
+    """Normalisasi satu item profil dari Apify (nama field bisa sedikit berbeda antar actor)."""
+    u = normalize_handle(g(item, "username", "ownerUsername"))
+    if not u or item.get("error"):
+        return None
+    f = g(item, "followersCount", "followers", "followerCount")
+    try:
+        followers = int(f) if f is not None else None
+    except (TypeError, ValueError):
+        followers = None
+    posts = g(item, "latestPosts", "posts", default=[])
+    posts = posts if isinstance(posts, list) else []
+    caps = " ".join(str(p.get("caption") or "")[:200] for p in posts[:6] if isinstance(p, dict))
+    bio = str(g(item, "biography", "bio", default="") or "")
+    contact = extract_contact(clean_text(bio, g(item, "businessEmail", "publicEmail", "email"),
+                                         g(item, "businessPhoneNumber", "publicPhoneNumber")))
+    return {
+        "username": u,
+        "full_name": str(g(item, "fullName", "ownerFullName", "full_name", default="") or ""),
+        "biography": bio,
+        "followers": followers,
+        "is_private": g(item, "private", "isPrivate"),
+        "is_business": g(item, "isBusinessAccount", "is_business_account"),
+        "category": clean_text(item.get("businessCategoryName"), item.get("categoryName")),
+        "engagement": engagement_from_posts(posts, followers),
+        "contact": contact,
+        "captions": caps[:900],
+    }
+
+
+# ---------------------------------------------------------------- cache
+def load_cache() -> dict[str, dict]:
+    try:
+        if CACHE_PATH.exists():
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_cache(cache: dict[str, dict]) -> None:
+    try:
+        now = time.time()
+        CACHE_PATH.write_text(json.dumps({k: v for k, v in cache.items() if now - v.get("ts", 0) < CACHE_TTL},
+                                         ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- niche custom
+def load_custom() -> dict[str, list[str]]:
+    try:
+        if NICHE_PATH.exists():
+            data = json.loads(NICHE_PATH.read_text(encoding="utf-8"))
+            return {str(k): [str(x) for x in v] for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_custom(data: dict[str, list[str]]) -> None:
+    try:
+        NICHE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def parse_terms(text: str) -> list[str]:
+    out = []
+    for raw in re.split(r"[\n,]+", text or ""):
+        t = raw.strip().strip('"').strip()
+        if t:
+            out.append(t)
+    return list(dict.fromkeys(out))
+
+
+def split_terms(terms: list[str]) -> tuple[list[str], list[str]]:
+    kws, tags = [], []
+    for t in terms:
+        t = t.strip().strip('"').strip()
+        if not t:
+            continue
+        if t.startswith("#"):
+            tag = re.sub(r"[^A-Za-z0-9_]", "", t.lstrip("#").lower())
+            if tag and tag not in tags:
+                tags.append(tag)
+        elif t.lower() not in [k.lower() for k in kws]:
+            kws.append(t)
+    return kws, tags
+
+
+def interleave(lists: list[list[str]]) -> list[str]:
+    out, seen = [], set()
+    for i in range(max((len(x) for x in lists), default=0)):
+        for lst in lists:
+            if i < len(lst) and lst[i].lower() not in seen:
+                seen.add(lst[i].lower())
+                out.append(lst[i])
     return out
 
 
-def run_parallel(fn, items: list, workers: int = WORKERS) -> list:
-    if not items:
-        return []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        return list(ex.map(fn, items))
+def dynamic_terms(terms: list[str]) -> set[str]:
+    out = set()
+    for t in terms:
+        k = t.strip().strip('"').lstrip("#").lower()
+        if len(k) >= 3 and k not in STOPWORDS:
+            out.add(k)
+    return out
 
 
-def filter_reason(c: Candidate, min_followers: int, max_followers: int) -> str | None:
-    """Alasan kandidat gugur. None = lolos."""
-    if not c.instagram_username or c.followers is None:
-        return "profil IG tidak terbaca / followers kosong"
-    if not (min_followers <= c.followers <= max_followers):
-        return "followers di luar range"
-    if c.match_confidence < 60:
-        return "match TikTok→IG lemah"
-    excluded, _hits = hard_excluded(clean_text(c.full_name, c.biography, c.category, c.source_username))
-    if excluded:
-        return "terdeteksi institusi (LPK/agency/dll)"
-    if c.is_private is True:
-        return "akun private"
-    if c.risk_score > 55:
-        return "skor risiko tinggi"
-    if c.personal_score < 8:
-        return "sinyal personal lemah"
+# ---------------------------------------------------------------- discovery
+def reject_reason(c: Candidate, min_f, max_f, levels, require_contact) -> str | None:
+    if not (min_f <= (c.followers or 0) <= max_f):
+        return "Ditolak: followers di luar range"
+    if c.is_private:
+        return "Ditolak: akun private"
+    if hard_excluded(clean_text(c.full_name, c.biography, c.category), c.username):
+        return "Ditolak: akun institusi"
+    if c.level not in levels:
+        return f"Ditolak: jenjang {c.level}"
+    if require_contact and not c.contact:
+        return "Ditolak: tanpa kontak"
+    if c.risk > 55 or c.creator < 8:
+        return "Ditolak: sinyal creator lemah"
     return None
 
 
-def prescore(c: Candidate) -> int:
-    """Skor murah (tanpa kredit) untuk menentukan siapa yang diverifikasi duluan."""
-    hay = clean_text(c.title, c.snippet, c.source_username).lower()
-    sc = sum(w for t, w in POSITIVE.items() if t in hay)
-    sc += sum(w for t, w in PERSONAL_SIGNALS.items() if t in hay)
-    sc += sum(w for t, w in JAPAN_SIGNALS.items() if t in hay)
-    sc -= sum(abs(p) for t, p in SOFT_NEGATIVE.items() if t in hay)
-    if len(c.sources) > 1:
-        sc += 40
-    if c.match_confidence >= 90:
-        sc += 10
-    return sc
+def row_of(c: Candidate) -> dict:
+    hay = hay_of(c)
+    return {
+        "Username": c.username,
+        "Instagram": f"@{c.username}",
+        "Followers": c.followers,
+        "Nama": c.full_name or "Perlu cek",
+        "Jenjang": c.level,
+        "Perlu Izin Ortu": needs_guardian(c.level),
+        "Duta/Prestasi": duta_tags(hay) or "-",
+        "Kontak di Bio": c.contact or "-",
+        "Skor Prospek": c.prospect, "Skor Kreator": c.creator,
+        "Engagement": round(c.engagement, 1), "Risiko": c.risk,
+        "Status": c.status,
+        "Alasan": ", ".join(c.reasons), "Warning": ", ".join(dict.fromkeys(c.warnings[:8])),
+        "Bio": c.biography, "Sumber": " | ".join(sorted(c.sources))[:300],
+        "Profil": c.url, "DM": f"https://ig.me/m/{c.username}",
+    }
 
 
-def build_df(cands: list[Candidate], limit: int | None = None) -> pd.DataFrame:
-    ordered = sorted(cands, key=lambda c: (-c.closing_score, -c.personal_score, -c.match_confidence, c.instagram_username))
-    if limit:
-        ordered = ordered[:limit]
-    rows = []
-    for i, c in enumerate(ordered, 1):
-        tt_url = f"https://www.tiktok.com/@{c.tiktok_username}" if c.tiktok_username else ""
-        rows.append({
-            "Rank": i,
-            "Sumber": " + ".join(sorted(c.sources)),
-            "Instagram": f"@{c.instagram_username}",
-            "Followers IG": c.followers,
-            "Nama IG": c.full_name or "Perlu cek",
-            "TikTok": f"@{c.tiktok_username}" if c.tiktok_username else "-",
-            "Prospek Closing": c.closing_score,
-            "Personal Creator": c.personal_score,
-            "Relevansi Jepang": c.relevance,
-            "Match TikTok→IG": c.match_confidence,
-            "Engagement": round(c.engagement_score, 1),
-            "Risiko Institusi": c.risk_score,
-            "Alasan": ", ".join(c.reasons[:8]),
-            "Warning": ", ".join(dict.fromkeys(c.warnings[:8])),
-            "Bio IG": c.biography,
-            "TikTok Context": c.title,
-            "Keyword": " | ".join(sorted(c.source_queries))[:450],
-            "Instagram Profile": c.instagram_url,
-            "TikTok Profile": tt_url,
-            "DM": f"https://ig.me/m/{c.instagram_username}",
-            "Status": "Belum DM",
-        })
-    return pd.DataFrame(rows)
-
-
-def get_searches_left(api_key: str) -> int | None:
+def load_database() -> pd.DataFrame:
     try:
-        acc = requests.get("https://serpapi.com/account.json", params={"api_key": api_key}, timeout=(10, 30)).json()
-        v = acc.get("total_searches_left", acc.get("plan_searches_left"))
-        return int(v) if v is not None else None
+        if DATABASE_PATH.exists():
+            return pd.read_csv(DATABASE_PATH)
     except Exception:
-        return None
+        pass
+    return pd.DataFrame()
 
 
-def run_pipeline(api_key: str, queries: list[str], blacklist: set[tuple[str, str]], target: int,
-                 min_followers: int, max_followers: int, pages: int, location: str, engine_mode: str,
-                 source_mode: str = "TikTok + Instagram", bio_only: bool = True, fetch_bio: bool = True,
-                 on_update=None) -> tuple[pd.DataFrame, list[str], str]:
-    """Pipeline bertahap: tiap putaran = 1 keyword -> cari -> verifikasi yang terbaik -> tampilkan.
-    Hasil yang sudah lolos tidak hilang walaupun kredit habis / terjadi error."""
-    use_tt = source_mode in ("TikTok + Instagram", "TikTok saja")
-    use_ig = source_mode in ("TikTok + Instagram", "Instagram saja")
-    errors: list[str] = []
-    stats: Counter = Counter()
-    drop: Counter = Counter()
-    results: dict[str, Candidate] = {}
-    pending: dict[str, Candidate] = {}
-    done_ig: set[str] = set()
-    stop_reason = ""
-    rounds = [(p, q) for p in range(pages) for q in queries]
-
-    def emit(msg: str) -> None:
-        if on_update:
-            frac = max(len(results) / max(1, target), BUDGET.used / max(1, BUDGET.limit))
-            on_update(build_df(list(results.values()), target), msg, min(1.0, frac))
-
-    def status_line(prefix: str) -> str:
-        return f"{prefix} | hasil {len(results)}/{target} | kredit {BUDGET.used}/{BUDGET.limit} | antre verifikasi {len(pending)}"
-
-    def add_pending(c: Candidate) -> None:
-        ig = c.instagram_username
-        if not ig or ("Instagram", ig) in blacklist:
-            return
-        existing = results.get(ig) or pending.get(ig)
-        if existing is not None:
-            existing.sources |= c.sources
-            existing.tiktok_username = existing.tiktok_username or c.tiktok_username
-            existing.source_queries |= c.source_queries
-            return
-        if ig not in done_ig:
-            pending[ig] = c
-
-    def verify_some(n: int) -> None:
-        batch: list[Candidate] = []
-        for c in sorted(pending.values(), key=lambda x: -prescore(x)):
-            ig = c.instagram_username
-            h = c.followers_hint
-            if h is not None and not (min_followers * 0.75 <= h <= max_followers * 1.25):
-                pending.pop(ig, None)
-                done_ig.add(ig)
-                drop["followers dari snippet di luar range (hemat 1 kredit)"] += 1
-                continue
-            batch.append(c)
-            if len(batch) >= n:
-                break
-        if not batch:
-            return
-        for c in batch:
-            pending.pop(c.instagram_username, None)
-            done_ig.add(c.instagram_username)
-
-        def _verify(c: Candidate) -> bool:
-            try:
-                enrich_from_instagram(api_key, c)
-                return True
-            except OutOfBudget:
-                return False
-
-        flags = run_parallel(_verify, batch)
-        for c, ok in zip(batch, flags):
-            if not ok:
-                continue
-            stats["verified"] += 1
-            reason = filter_reason(c, min_followers, max_followers)
-            if reason:
-                drop[reason] += 1
-                continue
-            if len(c.sources) > 1:
-                c.closing_score = min(100, c.closing_score + 5)
-                c.reasons.insert(0, "ketemu di TikTok & Instagram")
-            results[c.instagram_username] = c
-        if not all(flags):
-            raise OutOfBudget(BUDGET.reason or "batas kredit tercapai")
-
-    def _resolve(t: Candidate):
-        try:
-            return resolve_instagram(api_key, t, location, engine_mode, fetch_bio, search_fallback=not bio_only)
-        except OutOfBudget:
-            raise
-        except Exception as exc:
-            return None, 0, [f"resolve IG gagal: {exc}"]
-
-    kinds = (["tt"] if use_tt else []) + (["ig"] if use_ig else [])
-
-    def _search(args):
-        kind, query, page = args
-        try:
-            fn = tiktok_round if kind == "tt" else instagram_round
-            return fn(api_key, query, page, blacklist, location, engine_mode)
-        except OutOfBudget as exc:
-            return exc
-
+def save_database(db: pd.DataFrame) -> None:
+    if db.empty:
+        return
     try:
-        emit(status_line("Mulai"))
-        for ri, (page, query) in enumerate(rounds):
-            if len(results) >= target:
-                break
-            if BUDGET.reason or BUDGET.used >= BUDGET.limit:
-                raise OutOfBudget(BUDGET.reason or f"batas {BUDGET.limit} kredit per run tercapai")
-            emit(status_line(f"Keyword {ri + 1}/{len(rounds)}: {query}"))
+        old = load_database()
+        merged = pd.concat([old, db], ignore_index=True) if not old.empty else db
+        merged.drop_duplicates(subset=["Instagram"], keep="last").to_csv(DATABASE_PATH, index=False)
+    except Exception:
+        pass
 
-            outs = run_parallel(_search, [(k, query, page) for k in kinds], workers=2)
-            budget_exc = None
-            tts: list[Candidate] = []
-            for kind, out in zip(kinds, outs):
-                if isinstance(out, OutOfBudget):
-                    budget_exc = out
+
+def discover(token, actor, keywords, hashtags, blacklist, min_f, max_f, levels, require_contact, show_weak,
+             per_search, per_tag, max_details, max_cost, workers, progress: Callable[[str], None]):
+    STATS.clear()
+    STATS.update(keyword_runs=0, hashtag_posts=0, dari_search=0, dari_hashtag=0, detail_diminta=0,
+                 detail_dapat=0, cache=0, blacklist=0, ditolak=0)
+    errors: list[str] = []
+    cache = load_cache()
+    found: dict[str, dict] = {}
+    sources: dict[str, set[str]] = {}
+
+    def add(p: dict, src: str) -> None:
+        u = p["username"]
+        if u in blacklist:
+            STATS["blacklist"] += 1
+            return
+        sources.setdefault(u, set()).add(src)
+        old = found.get(u)
+        if old is None or (old.get("followers") is None and p.get("followers") is not None):
+            found[u] = {**(old or {}), **{k: v for k, v in p.items() if v not in (None, "")}}
+        elif p.get("captions") and not old.get("captions"):
+            old["captions"] = p["captions"]
+
+    fatal = False
+    # 1) Cari profil lewat kata kunci (hasil sudah berisi followers + bio)
+    if keywords:
+        progress(f"🔎 Mencari profil untuk {len(keywords)} kata kunci…")
+
+        def kw_job(kw: str) -> tuple[str, list[dict]]:
+            payload = {"search": kw, "searchType": "user", "searchLimit": per_search,
+                       "resultsType": "details", "resultsLimit": 1}
+            return kw, run_actor(token, actor, payload, max_cost=max_cost)
+
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futs = [ex.submit(kw_job, kw) for kw in keywords]
+            for fut in as_completed(futs):
+                try:
+                    kw, items = fut.result()
+                    STATS["keyword_runs"] += 1
+                    n = 0
+                    for it in items:
+                        p = profile_dict(it)
+                        if p:
+                            add(p, kw)
+                            n += 1
+                    STATS["dari_search"] += n
+                    progress(f"  • “{kw}” → {n} profil")
+                except ApifyError as exc:
+                    errors.append(str(exc))
+                    fatal = fatal or exc.fatal
+                except Exception as exc:
+                    errors.append(f"Kata kunci gagal: {exc}")
+
+    # 2) Cari lewat hashtag: ambil postingan → ambil pemilik postingan
+    if hashtags and not fatal:
+        progress(f"#️⃣ Mengambil postingan dari {len(hashtags)} hashtag…")
+        try:
+            payload = {"directUrls": [f"https://www.instagram.com/explore/tags/{t}/" for t in hashtags],
+                       "resultsType": "posts", "resultsLimit": per_tag}
+            items = run_actor(token, actor, payload, max_cost=max_cost)
+            STATS["hashtag_posts"] = len(items)
+            for it in items:
+                u = normalize_handle(g(it, "ownerUsername"))
+                if not u:
                     continue
-                cands, errs = out
-                errors.extend(errs)
-                if kind == "tt":
-                    tts.extend(cands)
-                else:
-                    stats["ig_found"] += len(cands)
-                    for c in cands:
-                        add_pending(c)
-            stats["tt_found"] += len(tts)
+                m = re.search(r"/tags/([^/]+)", str(it.get("inputUrl") or it.get("url") or ""))
+                tag = f"#{m.group(1)}" if m else "#hashtag"
+                add({"username": u, "full_name": str(g(it, "ownerFullName", default="") or ""),
+                     "captions": str(it.get("caption") or "")[:300]}, tag)
+                STATS["dari_hashtag"] += 1
+            progress(f"  • {len(items)} postingan → {sum(1 for v in sources.values() if any(s.startswith('#') for s in v))} akun")
+        except ApifyError as exc:
+            errors.append(str(exc))
+            fatal = fatal or exc.fatal
 
-            for t, (ig, conf, notes) in zip(tts, run_parallel(_resolve, tts)):
-                stats["tt_tried"] += 1
-                if not ig:
-                    continue
-                stats["tt_with_ig"] += 1
-                t.instagram_username = ig
-                t.match_confidence = conf
-                t.warnings.extend(notes)
-                add_pending(t)
+    # 3) Lengkapi detail (followers/bio) untuk akun yang belum punya
+    need = [u for u, p in found.items() if p.get("followers") is None]
+    for u in list(need):
+        hit = cache.get(u)
+        if hit and time.time() - hit.get("ts", 0) < CACHE_TTL:
+            found[u] = {**found[u], **hit["d"]}
+            STATS["cache"] += 1
+            need.remove(u)
+    need = need[:max_details]
+    STATS["detail_diminta"] = len(need)
+    if need and not fatal:
+        progress(f"👤 Mengambil detail {len(need)} profil (followers & bio)…")
+        try:
+            payload = {"directUrls": [f"https://www.instagram.com/{u}/" for u in need],
+                       "resultsType": "details", "resultsLimit": 1}
+            for it in run_actor(token, actor, payload, max_cost=max_cost):
+                p = profile_dict(it)
+                if p and p["username"] in found:
+                    found[p["username"]] = {**found[p["username"]], **{k: v for k, v in p.items() if v not in (None, "")}}
+                    STATS["detail_dapat"] += 1
+        except ApifyError as exc:
+            errors.append(str(exc))
+    for u, p in found.items():  # simpan ke cache yang sudah lengkap
+        if p.get("followers") is not None:
+            cache[u] = {"ts": time.time(), "d": {k: p.get(k) for k in
+                        ("full_name", "biography", "followers", "is_private", "is_business", "category",
+                         "engagement", "contact", "captions")}}
+    save_cache(cache)
 
-            verify_some(VERIFY_PER_ROUND)
-            emit(status_line(f"Keyword {ri + 1}/{len(rounds)} selesai"))
-            if budget_exc:
-                raise budget_exc
-
-        # Sisa kredit: habiskan antrean verifikasi
-        while pending and len(results) < target:
-            before = len(pending)
-            verify_some(VERIFY_PER_ROUND)
-            emit(status_line("Memverifikasi antrean"))
-            if len(pending) == before:
-                break
-    except OutOfBudget as exc:
-        stop_reason = str(exc)
-    except Exception as exc:
-        stop_reason = f"error tak terduga: {exc!r}"
-        errors.append(stop_reason)
-
-    log = [f"{msg} (x{n})" if n > 1 else msg for msg, n in Counter(errors).items()]
-    log.append("--- Ringkasan ---")
-    if stop_reason:
-        log.append(f"Berhenti: {stop_reason}")
-    log.append(f"Kredit terpakai: {BUDGET.used}/{BUDGET.limit} | pencarian dari cache (gratis): {BUDGET.cache_hits}")
-    log.append(f"[1] Discovery: TikTok {stats['tt_found']} creator | Instagram langsung {stats['ig_found']} akun")
-    if use_tt:
-        log.append(f"[2] IG dari TikTok: ketemu {stats['tt_with_ig']} dari {stats['tt_tried']} creator")
-    log.append(f"[3] Verifikasi profil IG: {stats['verified']} akun | lolos filter: {len(results)}")
-    for reason, n in drop.most_common():
-        log.append(f"    gugur: {reason} = {n}")
-    return build_df(list(results.values()), target), log, stop_reason
-
-
-def to_excel(df: pd.DataFrame) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="KOL Candidates")
-    return out.getvalue()
-
-
-def copy_box(text_value: str) -> None:
-    payload = json.dumps(text_value)
-    components.html(
-        f"""
-        <div style='font-family:Arial,sans-serif'>
-          <button onclick='copyMsg()' style='padding:8px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;'>📋 Copy DM</button>
-          <span id='status' style='margin-left:8px;font-size:13px;color:#555'></span>
-        </div>
-        <script>
-        const msg = {payload};
-        function copyMsg() {{
-          navigator.clipboard.writeText(msg).then(() => {{
-            document.getElementById('status').textContent = 'Copied';
-          }}).catch(() => {{
-            document.getElementById('status').textContent = 'Copy manual dari kotak teks';
-          }});
-        }}
-        </script>
-        """,
-        height=48,
-    )
+    # 4) Nilai & saring
+    kept: list[Candidate] = []
+    weak: list[Candidate] = []
+    allc: list[Candidate] = []
+    for u, p in found.items():
+        c = Candidate(u, f"https://www.instagram.com/{u}/", snippet=p.get("captions", ""),
+                      full_name=p.get("full_name", ""), biography=p.get("biography", ""),
+                      followers=p.get("followers"), is_private=p.get("is_private"),
+                      is_business=p.get("is_business"), category=p.get("category", ""),
+                      engagement=float(p.get("engagement") or 0), contact=p.get("contact", ""),
+                      sources=sources.get(u, set()))
+        c.level = detect_level(clean_text(c.full_name, c.biography))
+        if c.level == "Tidak jelas":  # bio tidak menyebut jenjang -> lihat caption postingan
+            c.level = detect_level(c.snippet)
+        score_candidate(c)
+        allc.append(c)
+        if c.followers is None:
+            c.status = "Detail tidak terbaca (cek manual)"
+            continue
+        reason = reject_reason(c, min_f, max_f, set(levels), require_contact)
+        if reason is None:
+            c.status = "Terverifikasi"
+            kept.append(c)
+        elif reason == "Ditolak: sinyal creator lemah" and show_weak:
+            c.status = "Sinyal lemah (cek manual)"
+            weak.append(c)
+        else:
+            c.status = reason
+            STATS["ditolak"] += 1
+    kept.sort(key=lambda c: (-c.prospect, -c.creator, c.username))
+    weak.sort(key=lambda c: (-c.prospect, c.username))
+    main_df = pd.DataFrame([row_of(c) for c in kept + weak])
+    db = pd.DataFrame([row_of(c) for c in allc])
+    if not db.empty:
+        save_database(db)
+    if not main_df.empty:
+        main_df.insert(0, "Rank", range(1, len(main_df) + 1))
+    return main_df, errors, db
 
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🌏", layout="wide")
-st.title("🌏 IGI Academy — KOL Finder v3.6")
-st.caption("TikTok + Instagram discovery (paralel) → gabung & dedupe → verifikasi followers IG 1K–15K → buang agency/LPK → ranking personal creator")
+# ---------------------------------------------------------------- DM templates (sesuai brief Batch 2)
+DM_ADULT = (
+    "Halo Kak {nama}! 👋🏻\n\n"
+    "Saya Nanda dari IGI Academy. Kami sedang membuka kolaborasi KOL untuk campaign "
+    "Persiapan Studi & Karir ke Jepang (Batch 2), dan kami tertarik dengan konten Kakak yang "
+    "relevan dengan teman-teman pelajar.\n\n"
+    "Benefit untuk Kakak:\n"
+    "• Kelas bahasa Jepang gratis (4 pertemuan, online/offline)\n"
+    "• Slot konsultasi karir, studi, & beasiswa ke Jepang gratis\n"
+    "• Program afiliasi: reward Rp500.000 untuk setiap pendaftar yang terverifikasi memakai kode Kakak\n"
+    "• Sertifikat kolaborasi + networking sesama KOL\n\n"
+    "Tugasnya 1 konten Reels/Carousel (20–45 detik) dengan gaya Kakak sendiri, collab dengan @igi.academy.\n\n"
+    "Kalau berkenan, saya kirim brief lengkapnya ya 🙏🏻\n{brief_link}"
+)
+DM_MINOR = (
+    "Halo {nama}! 👋🏻\n\n"
+    "Saya Nanda dari IGI Academy. Kami suka konten kamu dan ingin mengajak kolaborasi untuk "
+    "campaign persiapan studi ke Jepang bagi teman-teman pelajar.\n\n"
+    "Kamu akan dapat kelas bahasa Jepang gratis, sesi konsultasi studi & beasiswa gratis, serta "
+    "sertifikat kolaborasi. Karena kolaborasi ini memakai perjanjian (MoU) dan program afiliasi "
+    "berhadiah, kami perlu persetujuan orang tua/wali. Boleh kami kirim brief ke orang tua/wali, "
+    "atau kamu teruskan brief ini ke beliau dulu?\n\n{brief_link}\n\n"
+    "Terima kasih ya 🙏🏻"
+)
+T_ADULT, T_MINOR, T_BLANK, T_AUTO = "Dewasa (18+)", "Pelajar (di bawah 18)", "✏️ Tulis sendiri (kosong)", "Otomatis (sesuai jenjang)"
+DEFAULT_TEMPLATES = {T_ADULT: DM_ADULT, T_MINOR: DM_MINOR}
+
+
+def load_dm_templates() -> dict[str, str]:
+    data = dict(DEFAULT_TEMPLATES)
+    try:
+        if DM_PATH.exists():
+            data.update({str(k): str(v) for k, v in json.loads(DM_PATH.read_text(encoding="utf-8")).items()})
+    except Exception:
+        pass
+    return data
+
+
+def save_dm_templates(data: dict[str, str]) -> None:
+    try:
+        DM_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def fill_template(template: str, nama: str, username: str, brief_link: str) -> str:
+    return (template.replace("{nama}", nama).replace("{username}", f"@{username}")
+            .replace("{brief_link}", brief_link))
+
+
+# ---------------------------------------------------------------- UI
+st.set_page_config(page_title=APP_TITLE, page_icon="🎓", layout="wide")
+st.title("🎓 IGI Academy — KOL Finder v5 (Apify)")
+st.caption("Instagram langsung via Apify · 1K–10K followers · pelajar SMP/SMA · kata kunci profil + hashtag · "
+           "arah niche bisa kamu ubah sendiri")
 
 with st.sidebar:
     st.header("1. Sumber")
-    api_key = st.text_input("SerpAPI API Key", type="password")
+    token = st.text_input("Apify API Token", type="password",
+                          help="Apify Console → Settings → API & Integrations → Personal API tokens")
+    with st.expander("Pengaturan lanjutan Apify"):
+        actor = st.text_input("Actor", value=DEFAULT_ACTOR,
+                              help="Bisa diganti actor Instagram lain yang inputnya sama (search, searchType, directUrls, resultsType).")
+        max_cost = st.number_input("Batas biaya per run (USD, 0 = tanpa batas)", 0.0, 50.0, 1.0, 0.5)
+        workers = st.slider("Run paralel", 1, 5, 3)
     uploaded = st.file_uploader("Upload database KOL lama (XLSX/CSV)", type=["xlsx", "csv"])
-    cross_platform = st.checkbox("Username yang sama di IG/TikTok ikut diblokir", value=True)
-    blacklist = load_blacklist(uploaded, cross_platform=cross_platform)
-    st.info(f"Blacklist: **{len(blacklist):,}** akun/platform")
+    blacklist = load_blacklist(uploaded)
+    st.info(f"Blacklist: **{len(blacklist):,}** akun")
 
-    st.header("2. Discovery")
-    source_mode = st.radio("Sumber discovery", SOURCE_MODES, index=0,
-                           help="Mode gabungan mencari di TikTok dan Instagram bersamaan, lalu hasilnya digabung. Pemakaian kredit SerpApi lebih besar.")
-    min_followers = st.number_input("Min followers Instagram", min_value=1_000, value=1_000, step=500)
-    max_followers = st.number_input("Max followers Instagram", min_value=1_000, value=15_000, step=500)
-    target = st.number_input("Target hasil Instagram", min_value=5, max_value=100, value=50, step=5)
-    pages = st.selectbox("Halaman per keyword", [1, 2, 3], index=1)
-    max_queries = st.slider("Maksimal keyword per run", 4, 30, 18)
-    credit_limit = st.number_input("Batas kredit SerpApi per run", min_value=0, max_value=2000, value=40, step=10,
-                                   help="Aplikasi berhenti otomatis di batas ini dan tetap menampilkan hasil yang sudah didapat. Pencarian yang sama dari cache tidak dihitung.")
-    location = st.text_input("Lokasi pencarian", value="Indonesia")
-    engine_mode = st.selectbox("Mesin pencarian", ["Bing", "Auto (Bing → Google)", "Google"], index=1)
+    st.header("2. Kriteria")
+    min_followers = st.number_input("Min followers", min_value=100, value=1_000, step=500)
+    max_followers = st.number_input("Max followers", min_value=1_000, value=10_000, step=500)
+    levels = st.multiselect("Jenjang yang diterima", LEVELS, default=["SMP", "SMA/SMK", "Tidak jelas"])
+    require_contact = st.checkbox("Hanya yang punya kontak di bio (email/WA)", value=False)
+    show_weak = st.checkbox("Tampilkan juga yang sinyal pelajarnya lemah (cek manual)", value=True)
 
-    if source_mode != "Instagram saja":
-        tt_bio_only = st.checkbox("TikTok: hanya ambil yang IG-nya tertulis di bio", value=True,
-                                  help="Hemat kredit: tidak ada pencarian mapping TikTok→IG. Kalau dimatikan, creator tanpa IG di bio dicari manual lewat SerpApi (boros).")
-        tt_fetch_bio = st.checkbox("Baca bio langsung dari halaman TikTok (gratis)", value=True,
-                                   help="Tidak memakai kredit SerpApi. TikTok kadang memblokir, jadi tidak selalu berhasil.")
-    else:
-        tt_bio_only, tt_fetch_bio = True, False
+    st.header("3. Seberapa banyak (mengatur biaya)")
+    max_kw = st.slider("Maks kata kunci profil", 0, 20, 8)
+    per_search = st.slider("Profil per kata kunci", 5, 50, 15, 5)
+    max_tags = st.slider("Maks hashtag", 0, 15, 6)
+    per_tag = st.slider("Postingan per hashtag", 10, 100, 30, 10)
+    max_details = st.slider("Maks profil dilengkapi detailnya", 10, 200, 60, 10,
+                            help="Akun dari hashtag perlu 1 pengambilan detail agar followers & bio terbaca.")
 
-    st.header("3. Personal Japan Creator")
-    selected_packs = st.multiselect(
-        "Paket pencarian",
-        list(QUERY_PACKS.keys()),
-        default=["WNI / Japan Life", "Japan Vlog / Experience", "Work-in-Japan Personal"],
-    )
-    extra_text = st.text_area("Keyword tambahan (1/baris)", value="", height=90)
-    extra_keywords = [x.strip() for x in extra_text.splitlines() if x.strip()]
+    st.header("4. Arah niche / profil")
+    custom = load_custom()
+    ALL_PACKS = {**QUERY_PACKS, **custom}
+    packs = st.multiselect("Pilih arah niche (bisa lebih dari satu)", list(ALL_PACKS),
+                           default=[p for p in ["Pelajar SMA", "Duta / Prestasi", "Study / Edukasi",
+                                                "Jepang / Bahasa Asing"] if p in ALL_PACKS])
+    extra_text = st.text_area("Keyword/hashtag bebas (1 per baris)", height=90,
+                              placeholder="ketua osis\nanak sma malang\n#dutabahasa")
+    with st.expander("✏️ Ubah / buat niche sendiri"):
+        st.caption("Kata biasa = cari profil (mis. `duta bahasa`). Diawali # = cari hashtag (mis. `#dutabahasa`). "
+                   "1 baris 1 istilah.")
+        ed_pick = st.selectbox("Niche yang diedit", ["➕ Niche baru"] + list(ALL_PACKS), key="ed_pick")
+        new_mode = ed_pick.startswith("➕")
+        ed_name = st.text_input("Nama niche", value="" if new_mode else ed_pick, key=f"ed_name_{ed_pick}")
+        ed_terms = st.text_area("Istilah (1 per baris)", value="" if new_mode else "\n".join(ALL_PACKS[ed_pick]),
+                                height=200, key=f"ed_terms_{ed_pick}")
+        e1, e2 = st.columns(2)
+        if e1.button("💾 Simpan", use_container_width=True, key="niche_save"):
+            terms = parse_terms(ed_terms)
+            if ed_name.strip() and terms:
+                custom[ed_name.strip()] = terms
+                save_custom(custom)
+                st.rerun()
+            else:
+                st.warning("Isi nama niche dan minimal satu istilah.")
+        if e2.button("🗑️ Hapus / reset", use_container_width=True, key="niche_del"):
+            if ed_name.strip() in custom:
+                custom.pop(ed_name.strip())
+                save_custom(custom)
+                st.rerun()
+            else:
+                st.warning("Niche bawaan tidak bisa dihapus; edit lalu simpan untuk menimpa.")
+        if custom:
+            st.download_button("⬇️ Backup niche (JSON)", json.dumps(custom, ensure_ascii=False, indent=2),
+                               "niches.json", "application/json", use_container_width=True)
+        up = st.file_uploader("Impor niche (JSON)", type=["json"], key="niche_up")
+        if up is not None and st.button("📥 Impor", use_container_width=True, key="niche_import"):
+            try:
+                custom.update({str(k): [str(x) for x in v] for k, v in json.loads(up.getvalue()).items()})
+                save_custom(custom)
+                st.rerun()
+            except Exception:
+                st.error("File JSON tidak valid.")
 
-    st.header("4. DM")
-    default_dm = (
-        "Halo Kak {nama}! 👋🏻✨\n\n"
-        "Perkenalkan, saya Nanda dari IGI Academy. Sebelumnya saya sudah menghubungi Kakak terkait kesempatan kolaborasi.\n\n"
-        "Saat ini kami sedang membuka campaign Kelas Bahasa Jepang untuk persiapan bekerja ke Jepang melalui jalur Visa SSW 🇯🇵. Kami tertarik dengan konten Kakak yang relevan dengan Jepang dan ingin mengajak Kakak berkolaborasi.\n\n"
-        "Jika Kakak tertarik, saya siap kirimkan brief lengkapnya yaa 🙏🏻\n\n"
-        "{brief_link}"
-    )
-    dm_template = st.text_area("Template DM", value=default_dm, height=220)
-    brief_link = st.text_input("Link brief", value="https://drive.google.com/file/d/1mEJ8Ji9bnFoq79A_cFj6Ju_1eCtt8ZDG/view?usp=drive_link")
+    st.header("5. DM")
+    brief_link = st.text_input("Link brief", value=BRIEF_LINK)
+    dm_templates = load_dm_templates()
+    dm_choice = st.selectbox("Template DM", [T_AUTO, T_BLANK] + list(dm_templates))
+    with st.expander("✍️ Edit / buat template DM"):
+        st.caption("Placeholder: {nama} {username} {brief_link}")
+        edit_key = dm_choice if dm_choice in dm_templates else "baru"
+        t_name = st.text_input("Nama template", value=edit_key if edit_key != "baru" else "", key=f"t_name_{edit_key}")
+        t_body = st.text_area("Isi template", value=dm_templates.get(dm_choice, ""), height=240, key=f"t_body_{edit_key}")
+        s1, s2 = st.columns(2)
+        if s1.button("💾 Simpan", use_container_width=True, key="dm_save"):
+            if t_name.strip() and t_body.strip() and t_name.strip() not in (T_AUTO, T_BLANK):
+                dm_templates[t_name.strip()] = t_body
+                save_dm_templates(dm_templates)
+                st.rerun()
+            else:
+                st.warning("Isi nama dan isi template.")
+        if s2.button("↩️ Hapus / reset", use_container_width=True, key="dm_reset"):
+            if t_name.strip() in DEFAULT_TEMPLATES:
+                dm_templates[t_name.strip()] = DEFAULT_TEMPLATES[t_name.strip()]
+            else:
+                dm_templates.pop(t_name.strip(), None)
+            save_dm_templates(dm_templates)
+            st.rerun()
 
-if "results" not in st.session_state:
-    st.session_state.results = pd.DataFrame()
+for key in ("results", "all_found"):
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame()
 
-queries = build_queries(selected_packs, extra_keywords)[:max_queries]
-st.write(f"**{len(queries)} keyword** × **{pages} halaman**. Hasil muncul bertahap dan **tetap tersimpan walaupun kredit habis**. Maksimal **{credit_limit} kredit** per run; pencarian yang sama dari cache tidak memakai kredit lagi.")
+# gabungkan istilah dari niche terpilih + tambahan, lalu pisah: kata kunci profil vs hashtag
+pool_terms = interleave([list(ALL_PACKS.get(p, [])) for p in packs] + [parse_terms(extra_text)])
+all_kw, all_tags = split_terms(pool_terms)
+keywords, hashtags = all_kw[:max_kw], all_tags[:max_tags]
+DYNAMIC_TERMS.clear()
+DYNAMIC_TERMS.update(dynamic_terms([t for p in packs if p in custom for t in custom[p]] + parse_terms(extra_text)))
 
-check_col, run_col = st.columns([1, 3])
-with check_col:
-    test_api = st.button("🔌 Cek API", use_container_width=True)
-with run_col:
-    run = st.button("🔎 Cari Creator (TikTok + Instagram)", type="primary", use_container_width=True)
+est_results = len(keywords) * per_search + len(hashtags) * per_tag + max_details
+st.write(f"**{len(keywords)} kata kunci profil** + **{len(hashtags)} hashtag** → perkiraan maks "
+         f"**{est_results:,} hasil** ≈ **US$ {est_results * COST_PER_RESULT:.2f}** "
+         f"(perkiraan kasar; harga sebenarnya cek di Apify).")
+if keywords:
+    st.caption("Kata kunci: " + ", ".join(keywords))
+if hashtags:
+    st.caption("Hashtag: " + ", ".join("#" + t for t in hashtags))
 
-if test_api:
-    if not api_key:
-        st.error("Masukkan SerpAPI API Key dulu.")
+a, b = st.columns([1, 3])
+if a.button("🔌 Cek Token", use_container_width=True, key="btn_api"):
+    if not token:
+        st.error("Masukkan Apify token dulu.")
     else:
         try:
-            acc = requests.get("https://serpapi.com/account.json", params={"api_key": api_key}, timeout=(10, 30)).json()
-            a, b = st.columns(2)
-            a.metric("API", "OK")
-            b.metric("Sisa pencarian", acc.get("total_searches_left", acc.get("plan_searches_left", "-")))
-        except Exception as exc:
-            st.error(f"API tidak bisa diakses: {exc}")
+            me = apify_call("GET", "/users/me", token).get("data", {})
+            st.success(f"Token valid: {me.get('username', '?')}")
+            try:
+                lim = apify_call("GET", "/users/me/limits", token).get("data", {})
+                used = lim.get("current", {}).get("monthlyUsageUsd")
+                cap = lim.get("limits", {}).get("maxMonthlyUsageUsd")
+                if used is not None:
+                    st.metric("Pemakaian bulan ini (USD)", f"{used:.2f}", f"batas {cap}" if cap else None)
+            except ApifyError:
+                pass
+        except ApifyError as exc:
+            st.error(str(exc))
 
-if run:
-    if not api_key:
-        st.error("Masukkan SerpAPI API Key dulu.")
-    elif not queries:
-        st.error("Pilih minimal satu paket keyword atau isi keyword tambahan.")
+if b.button("🔎 Cari Creator Pelajar / Duta", type="primary", use_container_width=True, key="btn_search"):
+    if not token:
+        st.error("Masukkan Apify token dulu.")
+    elif not (keywords or hashtags):
+        st.error("Pilih minimal satu arah niche (atau isi keyword/hashtag).")
+    elif not levels:
+        st.error("Pilih minimal satu jenjang.")
     elif min_followers > max_followers:
-        st.error("Min followers tidak boleh lebih besar dari Max followers.")
+        st.error("Min followers tidak boleh lebih besar dari Max.")
     else:
-        left = get_searches_left(api_key)
-        limit = int(credit_limit) if left is None else max(0, min(int(credit_limit), left))
-        if left is not None:
-            st.caption(f"Sisa kredit akun SerpApi: {left} | batas run ini: {limit}")
-        BUDGET.reset(limit)
-        st.session_state.results = pd.DataFrame()
-        progress = st.progress(0.0)
-        status_box = st.empty()
-        live_box = st.empty()
-        live_cols = ["Rank", "Sumber", "Instagram", "Followers IG", "Nama IG", "Prospek Closing", "Personal Creator"]
-
-        def on_update(df_live: pd.DataFrame, msg: str, frac: float) -> None:
-            progress.progress(frac)
-            status_box.info(msg)
-            st.session_state.results = df_live
-            if not df_live.empty:
-                live_box.dataframe(df_live[live_cols], use_container_width=True, hide_index=True)
-
-        df, log, stop_reason = st.session_state.results, [], ""
+        status = st.status("Menjalankan pencarian di Apify… (bisa 1–5 menit)", expanded=True)
         try:
-            df, log, stop_reason = run_pipeline(
-                api_key, queries, blacklist, int(target),
-                int(min_followers), int(max_followers), int(pages), location, engine_mode,
-                source_mode=source_mode, bio_only=tt_bio_only, fetch_bio=tt_fetch_bio,
-                on_update=on_update,
-            )
+            df, errors, db = discover(token, actor, keywords, hashtags, blacklist, min_followers, max_followers,
+                                      levels, require_contact, show_weak, per_search, per_tag, max_details,
+                                      max_cost, workers, progress=status.write)
             st.session_state.results = df
+            st.session_state.all_found = db
+            status.update(label=f"Selesai — {len(df)} creator", state="complete", expanded=False)
+            st.info("**Ringkasan:** {dari_search} profil dari kata kunci · {hashtag_posts} postingan hashtag "
+                    "→ {dari_hashtag} akun · detail diminta {detail_diminta}, didapat {detail_dapat}, dari cache {cache} · "
+                    "blacklist {blacklist} · ditolak {ditolak}".format(**STATS))
+            for e in list(dict.fromkeys(errors))[:5]:
+                st.warning(e)
+            if df.empty:
+                st.warning("Belum ada yang lolos. Longgarkan kriteria (jenjang/kontak), naikkan jumlah kata kunci "
+                           "atau hashtag, atau buka 'Tes Apify' untuk melihat data mentah.")
         except Exception as exc:
-            st.error(f"Pencarian terhenti: {exc}. Hasil sementara tetap ditampilkan di bawah.")
-        progress.empty()
-        status_box.empty()
-        live_box.empty()
-        if stop_reason:
-            st.warning(f"Pencarian berhenti: {stop_reason}. {len(st.session_state.results)} akun yang sudah lolos tetap ditampilkan di bawah.")
-        elif st.session_state.results.empty:
-            st.warning("Belum ada kandidat yang lolos. Buka log di bawah untuk melihat di tahap mana kandidat gugur.")
-        if log:
-            with st.expander(f"Log pencarian & ringkasan ({len(log)} baris)", expanded=st.session_state.results.empty):
-                st.code("\n".join(log))
+            status.update(label="Gagal", state="error")
+            st.error(f"Pencarian gagal: {exc}")
 
-results = st.session_state.results
+with st.expander("🧪 Tes Apify (lihat data mentah)"):
+    t1, t2 = st.columns(2)
+    t_type = t1.selectbox("Jenis", ["Cari profil (user)", "Postingan hashtag"], key="t_type")
+    t_q = t2.text_input("Kata kunci / hashtag", value="duta bahasa", key="t_q")
+    if st.button("Jalankan tes kecil", key="btn_test"):
+        if not token:
+            st.error("Masukkan Apify token dulu.")
+        else:
+            try:
+                if t_type.startswith("Cari"):
+                    pl = {"search": t_q, "searchType": "user", "searchLimit": 3, "resultsType": "details", "resultsLimit": 1}
+                else:
+                    tag = re.sub(r"[^A-Za-z0-9_]", "", t_q.lstrip("#"))
+                    pl = {"directUrls": [f"https://www.instagram.com/explore/tags/{tag}/"],
+                          "resultsType": "posts", "resultsLimit": 5}
+                with st.spinner("Menjalankan…"):
+                    its = run_actor(token, actor, pl, max_wait=180, max_cost=0.3)
+                st.write(f"{len(its)} item mentah")
+                if its:
+                    st.json(its[0], expanded=False)
+                    st.dataframe(pd.DataFrame([{"username": g(i, "username", "ownerUsername"),
+                                                "followers": g(i, "followersCount"), "bio": str(i.get("biography", ""))[:80],
+                                                "caption": str(i.get("caption", ""))[:80]} for i in its]),
+                                 use_container_width=True, hide_index=True)
+            except ApifyError as exc:
+                st.error(str(exc))
+
+results = st.session_state.results.copy()
 if not results.empty:
-    st.subheader(f"Hasil — {len(results)} Instagram creator")
-    st.caption("Sumber: " + ", ".join(f"{k}: {v}" for k, v in results["Sumber"].value_counts().items()))
+    f1, f2, f3 = st.columns(3)
+    sort_by = f1.selectbox("Urutkan berdasarkan", [c for c in ["Skor Prospek", "Followers", "Engagement", "Skor Kreator", "Risiko"]
+                                                   if c in results.columns])
+    sort_desc = f2.selectbox("Urutan", ["Besar → kecil", "Kecil → besar"]) == "Besar → kecil"
+    only_ok = f3.checkbox("Hanya yang terverifikasi", value=False)
+    if only_ok:
+        results = results[results["Status"] == "Terverifikasi"]
+    results = results.sort_values(sort_by, ascending=not sort_desc, na_position="last").reset_index(drop=True)
+    results["Rank"] = range(1, len(results) + 1)
+    st.caption("Klik judul kolom di tabel untuk menyortir lagi.")
+if not results.empty:
+    n_ok = int((results["Status"] == "Terverifikasi").sum())
+    st.subheader(f"Hasil — {len(results)} creator")
+    st.caption(f"{n_ok} sesuai kriteria · {len(results) - n_ok} sinyal lemah / perlu cek manual sebelum dihubungi")
     st.dataframe(
-        results[[
-            "Rank", "Sumber", "Instagram", "Followers IG", "Nama IG", "TikTok", "Prospek Closing",
-            "Personal Creator", "Relevansi Jepang", "Match TikTok→IG", "Engagement",
-            "Risiko Institusi", "Alasan", "Warning", "Instagram Profile", "TikTok Profile", "DM"
-        ]],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Instagram Profile": st.column_config.LinkColumn("Instagram", display_text="Open IG"),
-            "TikTok Profile": st.column_config.LinkColumn("TikTok", display_text="Open TikTok"),
-            "DM": st.column_config.LinkColumn("DM", display_text="Open DM"),
-        },
+        results.drop(columns=["Bio", "Sumber"], errors="ignore"), use_container_width=True, hide_index=True,
+        column_config={"Profil": st.column_config.LinkColumn("Instagram", display_text="Open IG"),
+                       "DM": st.column_config.LinkColumn("DM", display_text="Open DM")},
     )
-    st.download_button(
-        "⬇️ Download kandidat XLSX",
-        data=to_excel(results),
-        file_name="igi_kol_candidates_v3.6.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    buf = io.BytesIO()
+    results.to_excel(buf, index=False, engine="openpyxl")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("⬇️ Download XLSX", buf.getvalue(), "igi_kol_study_v5.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    d2.download_button("⬇️ Download CSV", results.to_csv(index=False).encode("utf-8-sig"),
+                       "igi_kol_study_v5.csv", "text/csv", use_container_width=True)
+    d3.download_button("⬇️ Daftar username (TXT)", "\n".join(f"@{u}" for u in results["Username"]),
+                       "username_kol.txt", "text/plain", use_container_width=True)
 
     st.divider()
     st.subheader("Outreach satu per satu")
-    options = [f"{r['Instagram']} · {r['Nama IG']}" for _, r in results.iterrows()]
-    selected = st.selectbox("Pilih kandidat", options)
-    sel_username, sel_name = selected.split(" · ", 1)
-    row = results[results["Instagram"] == sel_username].iloc[0]
-    uname = sel_username.lstrip("@")
-    suggested_name = str(row["Nama IG"]) if str(row["Nama IG"]) not in ("", "nan", "Perlu cek") else uname.replace(".", " ").replace("_", " ").title()
-    dm_text = dm_template.replace("{username}", f"@{uname}").replace("{nama}", suggested_name).replace("{brief_link}", brief_link)
+    selected = st.selectbox("Pilih kandidat", [f"{r['Instagram']} · {r['Nama']}" for _, r in results.iterrows()])
+    handle = selected.split(" · ", 1)[0]
+    row = results[results["Instagram"] == handle].iloc[0]
+    uname = handle.lstrip("@")
+    nama = row["Nama"] if row["Nama"] != "Perlu cek" else uname.replace(".", " ").replace("_", " ").title()
+    minor = row["Perlu Izin Ortu"] != "Tidak"
+    if dm_choice == T_AUTO:
+        template = dm_templates[T_MINOR if minor else T_ADULT]
+    elif dm_choice == T_BLANK:
+        template = ""
+    else:
+        template = dm_templates.get(dm_choice, "")
+    dm_text = fill_template(template, nama, uname, brief_link)
+    dm_key = hashlib.md5(f"{dm_choice}|{template}|{brief_link}".encode()).hexdigest()[:8]
 
     left, right = st.columns([2, 1])
     with left:
-        st.text_area("Pesan siap kirim", value=dm_text, height=250, key=f"dm_ig_{uname}")
-        copy_box(dm_text)
+        if minor:
+            st.warning("Kemungkinan masih di bawah 18 tahun. Utamakan kontak resmi di bio atau orang tua/wali, "
+                       "dan pastikan MoU & afiliasi disetujui wali.")
+        edited = st.text_area("Pesan (boleh diubah)", value=dm_text, height=320, key=f"dm_{uname}_{dm_key}")
+        st.caption("Salin dengan ikon copy di pojok kanan kotak, lalu tempel dan kirim sendiri di Instagram.")
+        st.code(edited or " ", language=None)
     with right:
-        st.markdown(f"### {sel_username}")
-        st.write(f"Followers IG: **{row['Followers IG']:,}**")
-        st.write(f"Prospek closing: **{row['Prospek Closing']} / 100**")
-        st.write(f"Personal creator: **{row['Personal Creator']} / 100**")
-        st.write(f"Match TikTok → IG: **{row['Match TikTok→IG']} / 100**")
-        if row.get("Bio IG"):
-            st.caption(str(row["Bio IG"]))
+        st.markdown(f"### {handle}")
+        fol = row["Followers"]
+        fol_txt = f"{int(fol):,}" if pd.notna(fol) else "tidak terbaca"
+        st.write(f"Status: **{row['Status']}**")
+        st.write(f"Followers: **{fol_txt}** · Jenjang: **{row['Jenjang']}**")
+        st.write(f"Duta/Prestasi: **{row.get('Duta/Prestasi', '-')}**")
+        st.write(f"Skor prospek: **{row['Skor Prospek']}** · Skor kreator: **{row['Skor Kreator']}**")
+        st.write(f"Kontak bio: {row['Kontak di Bio']}")
+        if row.get("Bio"):
+            st.caption(str(row["Bio"]))
         st.link_button("💬 Buka DM Instagram", str(row["DM"]), use_container_width=True)
-        st.link_button("👤 Buka Profil Instagram", str(row["Instagram Profile"]), use_container_width=True)
-        if row.get("TikTok Profile"):
-            st.link_button("🎵 Buka TikTok", str(row["TikTok Profile"]), use_container_width=True)
-        if st.button("✅ Tandai Sudah DM", use_container_width=True):
-            record_contacted("Instagram", uname)
-            st.success("Masuk riwayat dan akan diblokir pada pencarian berikutnya.")
+        st.link_button("👤 Buka Profil", str(row["Profil"]), use_container_width=True)
+        if st.button("✅ Tandai Sudah Dihubungi", use_container_width=True, key="btn_contacted"):
+            record_contacted(uname)
+            st.success("Masuk riwayat, akan diblokir di pencarian berikutnya.")
             st.rerun()
 else:
-    st.info("Upload database lama + API key + pilih paket Personal Japan Creator, lalu klik tombol cari.")
+    st.info("Isi Apify token, pilih arah niche, lalu klik Cari Creator.")
 
-st.info("Auto-send cold DM tidak digunakan. Program hanya mencari, memetakan, memverifikasi, menyiapkan DM, dan membuka profil/DM; tombol Send tetap kamu yang tekan.")
+all_found = st.session_state.all_found
+if not all_found.empty:
+    st.divider()
+    st.subheader(f"Database username — {len(all_found)} akun ditemukan")
+    st.caption("Semua akun yang ditemukan di run ini (termasuk yang ditolak). Otomatis disimpan ke kol_database.csv.")
+    cols = [c for c in ["Username", "Followers", "Jenjang", "Duta/Prestasi", "Status", "Profil"] if c in all_found.columns]
+    st.dataframe(all_found[cols], use_container_width=True, hide_index=True,
+                 column_config={"Profil": st.column_config.LinkColumn("Profil", display_text="Open")})
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ Database (CSV)", all_found.to_csv(index=False).encode("utf-8-sig"),
+                       "igi_kol_database.csv", "text/csv", use_container_width=True)
+    xb = io.BytesIO()
+    all_found.to_excel(xb, index=False, engine="openpyxl")
+    c2.download_button("⬇️ Database (XLSX)", xb.getvalue(), "igi_kol_database.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+st.info("Tidak ada auto-send DM. Program hanya mencari dan menyiapkan pesan; tombol kirim tetap kamu yang tekan.")
